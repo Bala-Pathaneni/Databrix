@@ -1,0 +1,52 @@
+countries = [("USA", 10000, 20000), ("India", 1000, 1500), ("UK", 7000, 10000), ("Canada", 500, 700) ]
+columns = ["Country","NumVaccinated","AvailableDoses"]
+spark.createDataFrame(data=countries, schema = columns).write.format("delta").mode("overwrite").saveAsTable("silverTable")
+
+import pyspark.sql.functions as F
+spark.read.format("delta").table("silverTable").withColumn("VaccinationRate", F.col("NumVaccinated") / F.col("AvailableDoses")) \
+  .drop("NumVaccinated").drop("AvailableDoses") \
+  .write.format("delta").mode("overwrite").saveAsTable("goldTable")
+
+
+%sqlf
+ALTER TABLE silverTable SET TBLPROPERTIES (delta.enableChangeDataFeed = true)
+
+# Insert new records
+new_countries = [("Australia", 100, 3000)]
+spark.createDataFrame(data=new_countries, schema = columns).write.format("delta").mode("append").saveAsTable("silverTable")
+
+%sql
+-- update a record
+UPDATE silverTable SET NumVaccinated = '11000' WHERE Country = 'USA'
+
+%sql 
+-- view the changes
+SELECT * FROM table_changes('silverTable', 2, 5) order by _commit_timestamp
+
+changes_df = spark.read.format("delta").option("readChangeData", True).option("startingVersion", 2).table('silverTable')
+display(changes_df)
+
+%sql
+-- Collect only the latest version for each country
+CREATE OR REPLACE TEMPORARY VIEW silverTable_latest_version as
+SELECT * 
+    FROM 
+         (SELECT *, rank() over (partition by Country order by _commit_version desc) as rank
+          FROM table_changes('silverTable', 2, 5)
+          WHERE _change_type !='update_preimage')
+    WHERE rank=1
+    
+
+%sql
+select * from silverTable_latest_version
+
+%sql
+-- Merge the changes to gold
+MERGE INTO goldTable t USING silverTable_latest_version s ON s.Country = t.Country
+        WHEN MATCHED AND s._change_type='update_postimage' THEN UPDATE SET VaccinationRate = s.NumVaccinated/s.AvailableDoses
+        WHEN NOT MATCHED THEN INSERT (Country, VaccinationRate) VALUES (s.Country, s.NumVaccinated/s.AvailableDoses)
+
+%sql
+SELECT * FROM goldTable
+
+
